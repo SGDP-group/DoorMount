@@ -27,6 +27,11 @@ const PORT = 3000;
 const ESP32_IP = '192.168.1.100';  // Change to your ESP32 IP
 const ESP32_BASE_URL = `http://${ESP32_IP}`;
 
+// Logger
+function log(level, message) {
+  console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
+}
+
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
@@ -436,6 +441,23 @@ app.post('/api/flash', async (req, res) => {
 });
 
 /**
+ * Route: POST /api/signal/working
+ * Called by focusframe-api when a task status is set to "Ongoing".
+ * Signals the DoorMount to turn the LED red.
+ */
+app.post('/api/signal/working', async (req, res) => {
+  log('INFO', 'Received working signal from focusframe-api — setting LED red');
+  try {
+    await makeRequest('POST', '/color', { red: 255, green: 0, blue: 0 });
+    log('INFO', 'LED set to red successfully');
+    res.json({ status: 'ok', color: 'red' });
+  } catch (error) {
+    log('ERROR', `Failed to set LED red: ${error.message}`);
+    res.status(500).json({ error: 'Failed to set LED red', details: error.message });
+  }
+});
+
+/**
  * Route: GET /api/status
  * Get device status
  */
@@ -450,21 +472,14 @@ app.get('/api/status', async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════════╗
-║     ESP32 LED Controller - Express Server             ║
-║══════════════════════════════════════════════════════║
-║ Server running at:     http://localhost:${PORT}              ║
-║ ESP32 IP:              ${ESP32_IP}        ║
-║                                                        ║
-║ Open a browser and go to:                            ║
-║ http://localhost:${PORT}                           ║
-║══════════════════════════════════════════════════════║
-  `);
+  log('INFO', `ESP32 LED Controller server started`);
+  log('INFO', `Listening on http://localhost:${PORT}`);
+  log('INFO', `ESP32 target: ${ESP32_BASE_URL}`);
+  log('INFO', `Listening for working signal on POST http://localhost:${PORT}/api/signal/working`);
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\nServer shutting down...');
+  log('INFO', 'Server shutting down — SIGINT received');
   process.exit(0);
 });
