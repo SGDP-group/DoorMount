@@ -19,6 +19,7 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const http = require('http');
+const EventSource = require('eventsource');
 
 const app = express();
 const PORT = 3000;
@@ -26,6 +27,12 @@ const PORT = 3000;
 // Configuration
 const ESP32_IP = '192.168.1.100';  // Change to your ESP32 IP
 const ESP32_BASE_URL = `http://${ESP32_IP}`;
+const FOCUSFRAME_API_URL = process.env.FOCUSFRAME_API_URL || 'http://localhost:8080';
+
+// Logger
+function log(level, message) {
+  console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
+}
 
 // Middleware
 app.use(cors());
@@ -436,6 +443,36 @@ app.post('/api/flash', async (req, res) => {
 });
 
 /**
+ * SSE Client — Subscribe to focusframe-api color events
+ * Auto-connects on startup and reconnects on failure.
+ */
+function connectToSSE() {
+  const sseUrl = `${FOCUSFRAME_API_URL}/api/sse/doormount`;
+  log('INFO', `Connecting to SSE stream at ${sseUrl}`);
+
+  const es = new EventSource(sseUrl);
+
+  es.addEventListener('color', async (event) => {
+    try {
+      const { type, red, green, blue } = JSON.parse(event.data);
+      log('INFO', `SSE color event received — type: ${type}, RGB(${red}, ${green}, ${blue})`);
+      await makeRequest('POST', '/color', { red, green, blue });
+      log('INFO', `LED set to RGB(${red}, ${green}, ${blue}) successfully`);
+    } catch (error) {
+      log('ERROR', `Failed to handle SSE color event: ${error.message}`);
+    }
+  });
+
+  es.onopen = () => {
+    log('INFO', 'SSE connection established');
+  };
+
+  es.onerror = (err) => {
+    log('WARN', `SSE connection error — will auto-reconnect`);
+  };
+}
+
+/**
  * Route: GET /api/status
  * Get device status
  */
@@ -450,21 +487,15 @@ app.get('/api/status', async (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════════════╗
-║     ESP32 LED Controller - Express Server             ║
-║══════════════════════════════════════════════════════║
-║ Server running at:     http://localhost:${PORT}              ║
-║ ESP32 IP:              ${ESP32_IP}        ║
-║                                                        ║
-║ Open a browser and go to:                            ║
-║ http://localhost:${PORT}                           ║
-║══════════════════════════════════════════════════════║
-  `);
+  log('INFO', `ESP32 LED Controller server started`);
+  log('INFO', `Listening on http://localhost:${PORT}`);
+  connectToSSE();
+  log('INFO', `ESP32 target: ${ESP32_BASE_URL}`);
+  log('INFO', `Listening for working signal on POST http://localhost:${PORT}/api/signal/working`);
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\nServer shutting down...');
+  log('INFO', 'Server shutting down — SIGINT received');
   process.exit(0);
 });
