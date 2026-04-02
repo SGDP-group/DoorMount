@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <ctype.h>
 #include <Adafruit_NeoPixel.h>
@@ -17,6 +18,8 @@ static const char * kPrefsNamespace = "doormount";
 static const char * kPrefSsidKey = "ssid";
 static const char * kPrefPassKey = "pass";
 static const char * kPrefUserIdKey = "uid";
+static const char * kLedStatePath = "/api/doormount/led";
+static const char * kMdnsHost = "doormount";
 
 WebServer server(kHttpPort);
 Preferences prefs;
@@ -27,13 +30,49 @@ int32_t g_savedUserId = 0;
 
 String g_apSsid;
 bool g_apMode = false;
+bool g_mdnsStarted = false;
+String g_ledState = "GREEN";
 
 // ================= LED FUNCTIONS =================
-static void setLedsRed() {
+static void setLedsColor(uint8_t red, uint8_t green, uint8_t blue) {
 	for (int i = 0; i < NUMPIXELS; i++) {
-		pixels.setPixelColor(i, pixels.Color(255, 0, 0));
+		pixels.setPixelColor(i, pixels.Color(red, green, blue));
 	}
 	pixels.show();
+}
+
+static void setLedsRed() {
+	setLedsColor(255, 0, 0);
+}
+
+static void setLedsYellow() {
+	setLedsColor(255, 180, 0);
+}
+
+static void setLedsGreen() {
+	setLedsColor(0, 255, 0);
+}
+
+static bool applyLedState(const String & state) {
+	if (state == "RED") {
+		setLedsRed();
+		g_ledState = "RED";
+		return true;
+	}
+
+	if (state == "YELLOW") {
+		setLedsYellow();
+		g_ledState = "YELLOW";
+		return true;
+	}
+
+	if (state == "GREEN") {
+		setLedsGreen();
+		g_ledState = "GREEN";
+		return true;
+	}
+
+	return false;
 }
 
 // ================= HELPERS =================
@@ -139,7 +178,7 @@ static bool connectToHomeWifi(const String & ssid, const String & password, uint
 			Serial.print("[WiFi] Connected. IP: ");
 			Serial.println(WiFi.localIP());
 
-			setLedsRed();  // 🔴 TURN LEDs RED ON SUCCESS
+			setLedsGreen();
 
 			return true;
 		}
@@ -151,6 +190,26 @@ static bool connectToHomeWifi(const String & ssid, const String & password, uint
 	return false;
 }
 
+static void stopMdnsIfRunning() {
+	if (g_mdnsStarted) {
+		MDNS.end();
+		g_mdnsStarted = false;
+	}
+}
+
+static void startMdns(void) {
+	stopMdnsIfRunning();
+
+	if (MDNS.begin(kMdnsHost)) {
+		MDNS.addService("http", "tcp", kHttpPort);
+		g_mdnsStarted = true;
+		Serial.print("[mDNS] Registered host: ");
+		Serial.println(String(kMdnsHost) + ".local");
+	} else {
+		Serial.println("[mDNS] Failed to start mDNS responder.");
+	}
+}
+
 // ================= HTTP =================
 static void respondJson(int code, const String & json) {
 	server.send(code, "application/json", json);
@@ -158,8 +217,37 @@ static void respondJson(int code, const String & json) {
 
 static void handleHealth() {
 	String mode = g_apMode ? "ap" : "sta";
-	String body = String("{\"status\":\"ok\",\"mode\":\"") + mode + "\",\"apSsid\":\"" + g_apSsid + "\"}";
+	String staIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
+	String body = String("{\"status\":\"ok\",\"mode\":\"") + mode +
+				  "\",\"apSsid\":\"" + g_apSsid +
+				  "\",\"ledState\":\"" + g_ledState +
+				  "\",\"mdnsHost\":\"" + kMdnsHost +
+				  ".local\",\"staIp\":\"" + staIp + "\"}";
 	respondJson(200, body);
+}
+
+static void handleLedState() {
+	if (!server.hasArg("plain")) {
+		respondJson(400, "{\"status\":\"error\",\"message\":\"missing body\"}");
+		return;
+	}
+
+	String body = server.arg("plain");
+	String stateValue;
+	if (!extractJsonString(body, "state", stateValue)) {
+		respondJson(400, "{\"status\":\"error\",\"message\":\"invalid payload\"}");
+		return;
+	}
+
+	stateValue.trim();
+	stateValue.toUpperCase();
+
+	if (!applyLedState(stateValue)) {
+		respondJson(400, "{\"status\":\"error\",\"message\":\"unknown state\"}");
+		return;
+	}
+
+	respondJson(200, String("{\"status\":\"ok\",\"state\":\"") + g_ledState + "\"}");
 }
 
 static void handleDoormountSetup() {
@@ -213,6 +301,7 @@ static void handleNotFound() {
 static void configureRoutes() {
 	server.on("/health", HTTP_GET, handleHealth);
 	server.on("/api/doormount/setup", HTTP_POST, handleDoormountSetup);
+	server.on(kLedStatePath, HTTP_POST, handleLedState);
 	server.onNotFound(handleNotFound);
 }
 
@@ -224,6 +313,8 @@ static void startProvisioningAp() {
 	IPAddress localIp(192, 168, 4, 1);
 	IPAddress gateway(192, 168, 4, 1);
 	IPAddress subnet(255, 255, 255, 0);
+
+	stopMdnsIfRunning();
 
 	WiFi.disconnect(true, true);
 	WiFi.mode(WIFI_AP);
@@ -258,6 +349,11 @@ void setup() {
 
 		if (connectToHomeWifi(g_savedSsid, g_savedPassword, kStaConnectTimeoutMs)) {
 			g_apMode = false;
+			g_apSsid = "";
+			configureRoutes();
+			server.begin();
+			startMdns();
+			Serial.println("[HTTP] Runtime server listening on :8080");
 			Serial.println("[Boot] Running in STA mode.");
 			return;
 		}
@@ -272,7 +368,5 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
-	if (g_apMode) {
-		server.handleClient();
-	}
+	server.handleClient();
 }
