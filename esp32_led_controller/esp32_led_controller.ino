@@ -4,6 +4,7 @@
 #include <Preferences.h>
 #include <ctype.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_wifi.h>
 
 // ================= LED CONFIG =================
 #define LED_PIN        1
@@ -21,6 +22,15 @@ static const char * kPrefUserIdKey = "uid";
 static const char * kLedStatePath = "/api/doormount/led";
 static const char * kMdnsHost = "doormount";
 
+// Power knobs (code constants) for battery tuning.
+static const uint8_t kLedBrightnessPercent = 30U;
+static const uint8_t kApIdleBrightnessPercent = 12U;
+static const uint32_t kApIdleDimAfterMs = 120000U;
+static const uint16_t kLoopIdleDelayMs = 10U;
+static const uint8_t kCpuFrequencyMhz = 80U;
+static const bool kStaWifiPowerSaveEnabled = true;
+static const bool kDisableSerialAfterBoot = true;
+
 WebServer server(kHttpPort);
 Preferences prefs;
 
@@ -32,13 +42,88 @@ String g_apSsid;
 bool g_apMode = false;
 bool g_mdnsStarted = false;
 String g_ledState = "GREEN";
+bool g_ledOutputInitialized = false;
+bool g_apIdleDimApplied = false;
+uint32_t g_lastHttpActivityMs = 0;
+uint8_t g_activeBrightnessPercent = kLedBrightnessPercent;
+
+static void renderCurrentLedState(void);
+
+static uint8_t clampPercent(uint8_t percent) {
+	return (percent > 100U) ? 100U : percent;
+}
+
+static uint8_t scaleChannel(uint8_t channel, uint8_t brightnessPercent) {
+	uint16_t scaled = ((uint16_t)channel * (uint16_t)brightnessPercent + 50U) / 100U;
+	return (uint8_t)scaled;
+}
+
+static void setActiveLedBrightnessPercent(uint8_t brightnessPercent) {
+	uint8_t clamped = clampPercent(brightnessPercent);
+	if (g_activeBrightnessPercent == clamped) {
+		return;
+	}
+
+	g_activeBrightnessPercent = clamped;
+
+	if (g_ledOutputInitialized) {
+		renderCurrentLedState();
+	}
+}
+
+static const char * staWifiPowerSaveLabel(void) {
+	return kStaWifiPowerSaveEnabled ? "MIN_MODEM" : "NONE";
+}
+
+static void applyWifiPowerSavePolicy(void) {
+	wifi_ps_type_t psMode = WIFI_PS_NONE;
+	if (!g_apMode && kStaWifiPowerSaveEnabled) {
+		psMode = WIFI_PS_MIN_MODEM;
+	}
+
+	esp_wifi_set_ps(psMode);
+}
+
+static void markHttpActivity(void) {
+	g_lastHttpActivityMs = millis();
+
+	if (g_apMode && g_apIdleDimApplied) {
+		g_apIdleDimApplied = false;
+		setActiveLedBrightnessPercent(kLedBrightnessPercent);
+	}
+}
+
+static void applyApIdlePowerPolicy(void) {
+	if (!g_apMode || g_apIdleDimApplied) {
+		return;
+	}
+
+	if ((uint32_t)(millis() - g_lastHttpActivityMs) >= kApIdleDimAfterMs) {
+		g_apIdleDimApplied = true;
+		setActiveLedBrightnessPercent(kApIdleBrightnessPercent);
+	}
+}
+
+static void maybeDisableSerial(void) {
+	if (!kDisableSerialAfterBoot) {
+		return;
+	}
+
+	Serial.flush();
+	Serial.end();
+}
 
 // ================= LED FUNCTIONS =================
 static void setLedsColor(uint8_t red, uint8_t green, uint8_t blue) {
+	uint8_t scaledRed = scaleChannel(red, g_activeBrightnessPercent);
+	uint8_t scaledGreen = scaleChannel(green, g_activeBrightnessPercent);
+	uint8_t scaledBlue = scaleChannel(blue, g_activeBrightnessPercent);
+
 	for (int i = 0; i < NUMPIXELS; i++) {
-		pixels.setPixelColor(i, pixels.Color(red, green, blue));
+		pixels.setPixelColor(i, pixels.Color(scaledRed, scaledGreen, scaledBlue));
 	}
 	pixels.show();
+	g_ledOutputInitialized = true;
 }
 
 static void setLedsRed() {
@@ -53,26 +138,33 @@ static void setLedsGreen() {
 	setLedsColor(0, 255, 0);
 }
 
-static bool applyLedState(const String & state) {
-	if (state == "RED") {
+static void renderCurrentLedState(void) {
+	if (g_ledState == "RED") {
 		setLedsRed();
-		g_ledState = "RED";
-		return true;
+		return;
 	}
 
-	if (state == "YELLOW") {
+	if (g_ledState == "YELLOW") {
 		setLedsYellow();
-		g_ledState = "YELLOW";
-		return true;
+		return;
 	}
 
-	if (state == "GREEN") {
-		setLedsGreen();
-		g_ledState = "GREEN";
-		return true;
+	setLedsGreen();
+}
+
+static bool applyLedState(const String & state) {
+	if (state != "RED" && state != "YELLOW" && state != "GREEN") {
+		return false;
 	}
 
-	return false;
+	bool stateChanged = (g_ledState != state);
+	g_ledState = state;
+
+	if (stateChanged || !g_ledOutputInitialized) {
+		renderCurrentLedState();
+	}
+
+	return true;
 }
 
 // ================= HELPERS =================
@@ -171,6 +263,7 @@ static bool connectToHomeWifi(const String & ssid, const String & password, uint
 	WiFi.setAutoReconnect(true);
 	WiFi.persistent(false);
 	WiFi.begin(ssid.c_str(), password.c_str());
+	applyWifiPowerSavePolicy();
 
 	uint32_t startMs = millis();
 	while ((millis() - startMs) < timeoutMs) {
@@ -179,6 +272,7 @@ static bool connectToHomeWifi(const String & ssid, const String & password, uint
 			Serial.println(WiFi.localIP());
 
 			setLedsGreen();
+			applyWifiPowerSavePolicy();
 
 			return true;
 		}
@@ -216,17 +310,29 @@ static void respondJson(int code, const String & json) {
 }
 
 static void handleHealth() {
+	markHttpActivity();
+
 	String mode = g_apMode ? "ap" : "sta";
 	String staIp = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("");
 	String body = String("{\"status\":\"ok\",\"mode\":\"") + mode +
 				  "\",\"apSsid\":\"" + g_apSsid +
 				  "\",\"ledState\":\"" + g_ledState +
 				  "\",\"mdnsHost\":\"" + kMdnsHost +
-				  ".local\",\"staIp\":\"" + staIp + "\"}";
+				  ".local\",\"staIp\":\"" + staIp +
+				  "\",\"brightnessPct\":" + String(g_activeBrightnessPercent) +
+				  ",\"apIdleBrightnessPct\":" + String(kApIdleBrightnessPercent) +
+				  ",\"apIdleDimAfterMs\":" + String(kApIdleDimAfterMs) +
+				  ",\"loopDelayMs\":" + String(kLoopIdleDelayMs) +
+				  ",\"cpuFreqMhz\":" + String(kCpuFrequencyMhz) +
+				  ",\"staWifiPowerSave\":\"" + String(staWifiPowerSaveLabel()) +
+				  "\",\"apIdleDimmed\":" + String(g_apIdleDimApplied ? "true" : "false") +
+				  "}";
 	respondJson(200, body);
 }
 
 static void handleLedState() {
+	markHttpActivity();
+
 	if (!server.hasArg("plain")) {
 		respondJson(400, "{\"status\":\"error\",\"message\":\"missing body\"}");
 		return;
@@ -251,6 +357,8 @@ static void handleLedState() {
 }
 
 static void handleDoormountSetup() {
+	markHttpActivity();
+
 	if (!server.hasArg("plain")) {
 		respondJson(400, "{\"status\":\"error\",\"message\":\"missing body\"}");
 		return;
@@ -295,6 +403,7 @@ static void handleDoormountSetup() {
 }
 
 static void handleNotFound() {
+	markHttpActivity();
 	respondJson(404, "{\"status\":\"error\",\"message\":\"not found\"}");
 }
 
@@ -322,9 +431,14 @@ static void startProvisioningAp() {
 
 	WiFi.softAP(g_apSsid.c_str());
 
+	g_apMode = true;
+	g_lastHttpActivityMs = millis();
+	g_apIdleDimApplied = false;
+	setActiveLedBrightnessPercent(kLedBrightnessPercent);
+	applyWifiPowerSavePolicy();
+
 	configureRoutes();
 	server.begin();
-	g_apMode = true;
 
 	Serial.println("[AP] Started: " + g_apSsid);
 	Serial.println("[HTTP] Provisioning server listening on :8080");
@@ -335,9 +449,13 @@ void setup() {
 	Serial.begin(115200);
 	delay(500);
 
+	setCpuFrequencyMhz(kCpuFrequencyMhz);
+
 	pixels.begin();
 	pixels.clear();
 	pixels.show();
+	setActiveLedBrightnessPercent(kLedBrightnessPercent);
+	g_lastHttpActivityMs = millis();
 
 	Serial.println();
 	Serial.println("=== DoorMount ESP32-C3 Boot ===");
@@ -350,11 +468,14 @@ void setup() {
 		if (connectToHomeWifi(g_savedSsid, g_savedPassword, kStaConnectTimeoutMs)) {
 			g_apMode = false;
 			g_apSsid = "";
+			setActiveLedBrightnessPercent(kLedBrightnessPercent);
+			g_apIdleDimApplied = false;
 			configureRoutes();
 			server.begin();
 			startMdns();
 			Serial.println("[HTTP] Runtime server listening on :8080");
 			Serial.println("[Boot] Running in STA mode.");
+			maybeDisableSerial();
 			return;
 		}
 
@@ -364,9 +485,12 @@ void setup() {
 	}
 
 	startProvisioningAp();
+	maybeDisableSerial();
 }
 
 // ================= LOOP =================
 void loop() {
 	server.handleClient();
+	applyApIdlePowerPolicy();
+	delay(kLoopIdleDelayMs);
 }
